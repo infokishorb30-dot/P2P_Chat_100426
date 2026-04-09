@@ -68,12 +68,14 @@ function App() {
   // Stable refs to avoid stale closures inside PeerJS event handlers
   const activeChatRef        = useRef({ id: null, type: 'dm' })
   const myIdRef              = useRef('')
+  const groupsRef            = useRef({})   // always holds latest groups without stale closures
   const messagesEndRef       = useRef(null)
   const inputRef             = useRef(null)
 
   // Keep stable refs in sync with state
   useEffect(() => { activeChatRef.current = { id: activeChatId, type: activeChatType } }, [activeChatId, activeChatType])
   useEffect(() => { myIdRef.current = myId }, [myId])
+  useEffect(() => { groupsRef.current = groups }, [groups])
 
   // Auto-scroll to latest message
   useEffect(() => {
@@ -158,8 +160,18 @@ function App() {
   }
 
   const autoReconnectKnownPeers = () => {
+    // Reconnect DM contacts
     Object.keys(contacts).forEach(pid => {
       if (!connectionsRef.current[pid] || !connectionsRef.current[pid].open) attemptReconnect(pid)
+    })
+    // FIX: Also reconnect to group members who may not be DM contacts
+    Object.values(groupsRef.current).forEach(group => {
+      ;(group.members || []).forEach(pid => {
+        if (pid !== myIdRef.current && (!connectionsRef.current[pid] || !connectionsRef.current[pid].open)) {
+          reconnectAttemptsRef.current[pid] = 0 // reset counter for a fresh startup attempt
+          attemptReconnect(pid)
+        }
+      })
     })
   }
 
@@ -175,21 +187,29 @@ function App() {
   const handleGroupMessage = (data, fromPeerId) => {       // eslint-disable-line no-unused-vars
     switch (data.type) {
       case 'group_invite': {
-        setGroups(prev => ({
-          ...prev,
-          [data.groupId]: {
-            id: data.groupId,
-            name: data.groupName,
-            members: data.members,
-            createdBy: data.invitedBy,
-            createdAt: Date.now(),
-            unread: 0,
-            lastActivity: Date.now()
+        // FIX: Upsert (merge) instead of overwrite — never lose members from a stale invite
+        setGroups(prev => {
+          const existing = prev[data.groupId]
+          const mergedMembers = existing
+            ? [...new Set([...existing.members, ...(data.members || [])])]
+            : (data.members || [])
+          return {
+            ...prev,
+            [data.groupId]: {
+              id: data.groupId,
+              name: data.groupName,
+              members: mergedMembers,
+              createdBy: data.invitedBy,
+              createdAt: existing?.createdAt || Date.now(),
+              unread: existing?.unread || 0,
+              lastActivity: existing?.lastActivity || Date.now()
+            }
           }
-        }))
-        // Ensure we are connected to all group peers
+        })
+        // FIX: Reset attempt counter before reconnecting so the 5-attempt limit never silently blocks
         ;(data.members || []).forEach(pid => {
           if (pid !== myIdRef.current && (!connectionsRef.current[pid] || !connectionsRef.current[pid].open)) {
+            reconnectAttemptsRef.current[pid] = 0
             attemptReconnect(pid)
           }
         })
@@ -275,6 +295,23 @@ function App() {
         const msg = queue[0]
         try { connection.send(msg); queue.shift() } catch { break }
       }
+      // FIX: Gossip — re-send group invites for every shared group.
+      // Guarantees a peer who was offline when first invited always receives the group state
+      // once they come back online, regardless of message queue state.
+      Object.values(groupsRef.current).forEach(group => {
+        const members = group.members || []
+        if (members.includes(pid) && members.includes(myIdRef.current)) {
+          try {
+            connection.send(JSON.stringify({
+              type: 'group_invite',
+              groupId: group.id,
+              groupName: group.name,
+              members,
+              invitedBy: myIdRef.current
+            }))
+          } catch { /* ignore — they'll get it on next open */ }
+        }
+      })
     })
 
     connection.on('data', (rawData) => {
