@@ -71,11 +71,14 @@ function App() {
   const groupsRef            = useRef({})   // always holds latest groups without stale closures
   const messagesEndRef       = useRef(null)
   const inputRef             = useRef(null)
+  const seenMsgIdsRef        = useRef(new Set()) // dedup for group msg relay
+  const isOnlineRef          = useRef(navigator.onLine)
 
   // Keep stable refs in sync with state
   useEffect(() => { activeChatRef.current = { id: activeChatId, type: activeChatType } }, [activeChatId, activeChatType])
   useEffect(() => { myIdRef.current = myId }, [myId])
   useEffect(() => { groupsRef.current = groups }, [groups])
+  useEffect(() => { isOnlineRef.current = isOnline }, [isOnline])
 
   // Auto-scroll to latest message
   useEffect(() => {
@@ -216,6 +219,19 @@ function App() {
         break
       }
       case 'group_msg': {
+        // ── Deduplication ────────────────────────────────────────────────
+        // Prevents the same message being shown twice when it arrives via
+        // both a direct connection AND a relay path.
+        if (data.msgId) {
+          if (seenMsgIdsRef.current.has(data.msgId)) break
+          seenMsgIdsRef.current.add(data.msgId)
+          // Prune seen-set to prevent unbounded memory growth
+          if (seenMsgIdsRef.current.size > 500) {
+            const arr = [...seenMsgIdsRef.current]
+            seenMsgIdsRef.current = new Set(arr.slice(arr.length - 400))
+          }
+        }
+        // ── Store message ────────────────────────────────────────────────
         setGroupSessions(prev => ({
           ...prev,
           [data.groupId]: [...(prev[data.groupId] || []), {
@@ -231,6 +247,24 @@ function App() {
             const g = prev[data.groupId]
             if (!g) return prev
             return { ...prev, [data.groupId]: { ...g, unread: (g.unread || 0) + 1, lastActivity: Date.now() } }
+          })
+        }
+        // ── Relay ────────────────────────────────────────────────────────
+        // Forward to every group member we're connected to, EXCEPT:
+        //   • ourselves
+        //   • the original sender (they already have it)
+        //   • the peer who just forwarded it to us (prevents ping-pong)
+        // This lets A→B→C work when A→C direct WebRTC fails.
+        const grp = groupsRef.current[data.groupId]
+        if (grp && data.msgId) {
+          const relayStr = JSON.stringify(data)
+          ;(grp.members || []).forEach(pid => {
+            if (pid !== myIdRef.current && pid !== data.sender && pid !== fromPeerId) {
+              const conn = connectionsRef.current[pid]
+              if (conn && conn.open) {
+                try { conn.send(relayStr) } catch {}
+              }
+            }
           })
         }
         break
@@ -277,6 +311,14 @@ function App() {
   // ── Connection management ──────────────────────────────────────────
   const handleIncomingConnection = (connection) => {
     const pid = connection.peer
+    const existing = connectionsRef.current[pid]
+    // Guard: if we already have an open connection, reject the duplicate.
+    // Without this, two peers calling connect() simultaneously overwrites
+    // the tracked ref, then the close-handler deletes the working connection.
+    if (existing && existing.open) {
+      try { connection.close() } catch {}
+      return
+    }
     connectionsRef.current[pid] = connection
     updateContactStatus(pid, true)
     setupConnectionListeners(connection)
@@ -336,7 +378,14 @@ function App() {
       })
     })
 
-    connection.on('close', () => { updateContactStatus(pid, false); delete connectionsRef.current[pid] })
+    connection.on('close', () => {
+      // Only clean up if THIS exact connection is the one tracked in the ref.
+      // A duplicate connection's close event should not remove the good connection.
+      if (connectionsRef.current[pid] === connection) {
+        updateContactStatus(pid, false)
+        delete connectionsRef.current[pid]
+      }
+    })
     connection.on('error', (err) => {
       console.error(`Connection error with ${pid}:`, err)
       updateContactStatus(pid, false)
@@ -351,7 +400,7 @@ function App() {
     reconnectAttemptsRef.current[pid] = attempts + 1
     const delay = Math.pow(2, attempts + 1) * 1000
     reconnectTimeoutRef.current[pid] = setTimeout(() => {
-      if (!isOnline || !peerRef.current) return
+      if (!isOnlineRef.current || !peerRef.current) return
       if (!connectionsRef.current[pid] || !connectionsRef.current[pid].open) {
         const c = peerRef.current.connect(pid, { reliable: true })
         connectionsRef.current[pid] = c
@@ -433,7 +482,11 @@ function App() {
     const group = groups[activeChatId]
     if (!group) return
     const timestamp = Date.now()
-    const payload = { type: 'group_msg', groupId: activeChatId, text, sender: myId, senderName: myId, timestamp }
+    // Unique message ID — used for relay deduplication across all members
+    const msgId = myId + '_' + timestamp.toString(36) + '_' + Math.random().toString(36).slice(2, 6)
+    const payload = { type: 'group_msg', groupId: activeChatId, text, sender: myId, senderName: myId, timestamp, msgId }
+    // Pre-register own message so relay-back doesn't duplicate it in our own view
+    seenMsgIdsRef.current.add(msgId)
     // Broadcast to every other member
     group.members.filter(pid => pid !== myId).forEach(pid => sendTypedMessage(pid, payload))
     // Save locally
