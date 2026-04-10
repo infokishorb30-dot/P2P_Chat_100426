@@ -73,12 +73,14 @@ function App() {
   const inputRef             = useRef(null)
   const seenMsgIdsRef        = useRef(new Set()) // dedup for group msg relay
   const isOnlineRef          = useRef(navigator.onLine)
+  const contactsRef          = useRef({})   // stable ref for contacts (for use in intervals)
 
   // Keep stable refs in sync with state
   useEffect(() => { activeChatRef.current = { id: activeChatId, type: activeChatType } }, [activeChatId, activeChatType])
   useEffect(() => { myIdRef.current = myId }, [myId])
   useEffect(() => { groupsRef.current = groups }, [groups])
   useEffect(() => { isOnlineRef.current = isOnline }, [isOnline])
+  useEffect(() => { contactsRef.current = contacts }, [contacts])
 
   // Auto-scroll to latest message
   useEffect(() => {
@@ -116,7 +118,21 @@ function App() {
   const initializePeer = (customId) => {
     if (peerRef.current) peerRef.current.destroy()
     setStatus('Initializing...')
-    const peer = new Peer(customId)
+    const peer = new Peer(customId, {
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
+          // Free public TURN relay — ensures connections work even through strict NAT
+          { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
+          { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+          { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+        ]
+      }
+    })
     peerRef.current = peer
 
     peer.on('open', (id) => {
@@ -462,14 +478,28 @@ function App() {
       lastActivity: Date.now()
     }
     setGroups(prev => ({ ...prev, [groupId]: group }))
-    // Invite all selected members
-    selectedMembers.forEach(pid => sendTypedMessage(pid, {
-      type: 'group_invite',
-      groupId,
-      groupName: group.name,
-      members: group.members,
-      invitedBy: myId
-    }))
+
+    // For each member: if not currently connected, establish a direct connection
+    // IMMEDIATELY (no delay) so the invite arrives as fast as possible.
+    // sendTypedMessage will also trigger the exponential-backoff reconnect loop
+    // as a secondary fallback.
+    selectedMembers.forEach(pid => {
+      if (!connectionsRef.current[pid] || !connectionsRef.current[pid].open) {
+        reconnectAttemptsRef.current[pid] = 0  // fresh start
+        if (peerRef.current) {
+          const nc = peerRef.current.connect(pid, { reliable: true })
+          if (nc) { connectionsRef.current[pid] = nc; setupConnectionListeners(nc) }
+        }
+      }
+      sendTypedMessage(pid, {
+        type: 'group_invite',
+        groupId,
+        groupName: group.name,
+        members: group.members,
+        invitedBy: myId
+      })
+    })
+
     setShowCreateGroup(false)
     setNewGroupName('')
     setSelectedMembers([])
@@ -626,6 +656,34 @@ function App() {
       })
     }, 1000)
     return () => clearInterval(interval)
+  }, [])
+
+  // Periodic mesh maintenance — every 30 s, reset attempt counters and retry
+  // connections to ALL group members and DM contacts.
+  // This ensures that peers who were offline at group-creation time (or who
+  // exhausted the 5-attempt reconnect limit) are eventually reached when they
+  // come back online, without requiring a page refresh.
+  useEffect(() => {
+    const meshInterval = setInterval(() => {
+      if (!peerRef.current || !myIdRef.current) return
+      // Re-connect to every group member
+      Object.values(groupsRef.current).forEach(group => {
+        ;(group.members || []).forEach(pid => {
+          if (pid !== myIdRef.current && (!connectionsRef.current[pid] || !connectionsRef.current[pid].open)) {
+            reconnectAttemptsRef.current[pid] = 0  // reset so 5-attempt cap doesn't block us
+            attemptReconnect(pid)
+          }
+        })
+      })
+      // Also re-connect to DM contacts
+      Object.keys(contactsRef.current).forEach(pid => {
+        if (!connectionsRef.current[pid] || !connectionsRef.current[pid].open) {
+          reconnectAttemptsRef.current[pid] = 0
+          attemptReconnect(pid)
+        }
+      })
+    }, 30000)
+    return () => clearInterval(meshInterval)
   }, [])
 
   // ── UI helpers ─────────────────────────────────────────────────────
