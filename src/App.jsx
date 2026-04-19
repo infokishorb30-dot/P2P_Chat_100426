@@ -146,6 +146,14 @@ function App() {
 
     peer.on('connection', handleIncomingConnection)
 
+    // Reconnect PeerJS signaling websocket when WiFi/mobile drops the connection
+    peer.on('disconnected', () => {
+      console.warn('PeerJS signaling disconnected — reconnecting...')
+      if (peerRef.current && !peerRef.current.destroyed) {
+        try { peerRef.current.reconnect() } catch {}
+      }
+    })
+
     peer.on('error', (err) => {
       console.error('Peer error:', err)
       if (err.type === 'unavailable-id') {
@@ -328,12 +336,12 @@ function App() {
   const handleIncomingConnection = (connection) => {
     const pid = connection.peer
     const existing = connectionsRef.current[pid]
-    // Guard: if we already have an open connection, reject the duplicate.
-    // Without this, two peers calling connect() simultaneously overwrites
-    // the tracked ref, then the close-handler deletes the working connection.
-    if (existing && existing.open) {
-      try { connection.close() } catch {}
-      return
+    // Always accept the incoming connection and close the old one.
+    // On WiFi/mobile, a stale connection stays conn.open===true for 30+ seconds
+    // after the network path dies. Rejecting the fresh connection would leave us
+    // stuck on the ghost, so we always prefer the newest inbound connection.
+    if (existing) {
+      try { existing.close() } catch {}
     }
     connectionsRef.current[pid] = connection
     updateContactStatus(pid, true)
@@ -378,7 +386,11 @@ function App() {
       if (typeof rawData === 'string') {
         try {
           const parsed = JSON.parse(rawData)
-          if (parsed && parsed.type) { handleGroupMessage(parsed, pid); return }
+          if (parsed && parsed.type) {
+            if (parsed.type === 'ping') return  // heartbeat keepalive — nothing to do
+            handleGroupMessage(parsed, pid)
+            return
+          }
         } catch { /* not JSON — fall through to plain 1:1 handling */ }
       }
       // Plain 1:1 message
@@ -414,7 +426,8 @@ function App() {
     const attempts = reconnectAttemptsRef.current[pid] || 0
     if (attempts >= 5) return
     reconnectAttemptsRef.current[pid] = attempts + 1
-    const delay = Math.pow(2, attempts + 1) * 1000
+    // First attempt is near-immediate; subsequent attempts back off (1s, 2s, 4s, 8s)
+    const delay = attempts === 0 ? 300 : Math.min(Math.pow(2, attempts) * 1000, 16000)
     reconnectTimeoutRef.current[pid] = setTimeout(() => {
       if (!isOnlineRef.current || !peerRef.current) return
       if (!connectionsRef.current[pid] || !connectionsRef.current[pid].open) {
@@ -456,11 +469,17 @@ function App() {
     const str = JSON.stringify(payload)
     const conn = connectionsRef.current[pid]
     if (conn && conn.open) {
-      try { conn.send(str); return } catch {}
+      try { conn.send(str); return } catch {
+        // Looks open but send failed — ghost/stale connection (common after WiFi switch).
+        // Close it explicitly and fall through to queue + fresh reconnect.
+        try { conn.close() } catch {}
+        if (connectionsRef.current[pid] === conn) delete connectionsRef.current[pid]
+      }
     }
     // Queue for later + trigger reconnect
     if (!messageQueueRef.current[pid]) messageQueueRef.current[pid] = []
     messageQueueRef.current[pid].push(str)
+    reconnectAttemptsRef.current[pid] = 0  // reset counter so stale cap never blocks us
     attemptReconnect(pid)
   }
 
@@ -509,7 +528,8 @@ function App() {
 
   const sendGroupMessage = (text) => {
     if (!activeChatId || activeChatType !== 'group' || !text.trim()) return
-    const group = groups[activeChatId]
+    // Use groupsRef (always current) not the stale `groups` closure — critical for M2M
+    const group = groupsRef.current[activeChatId]
     if (!group) return
     const timestamp = Date.now()
     // Unique message ID — used for relay deduplication across all members
@@ -658,31 +678,55 @@ function App() {
     return () => clearInterval(interval)
   }, [])
 
-  // Periodic mesh maintenance — every 30 s, reset attempt counters and retry
-  // connections to ALL group members and DM contacts.
-  // This ensures that peers who were offline at group-creation time (or who
-  // exhausted the 5-attempt reconnect limit) are eventually reached when they
-  // come back online, without requiring a page refresh.
+  // Heartbeat — ping every open connection every 15 s.
+  // If the send throws, the connection is a ghost (WiFi changed, NAT timed out).
+  // We close it immediately and schedule a fresh reconnect.
+  useEffect(() => {
+    const hbInterval = setInterval(() => {
+      if (!myIdRef.current) return
+      Object.entries(connectionsRef.current).forEach(([pid, conn]) => {
+        if (conn && conn.open) {
+          try {
+            conn.send(JSON.stringify({ type: 'ping' }))
+          } catch {
+            // Ghost connection — clean up and reconnect
+            try { conn.close() } catch {}
+            if (connectionsRef.current[pid] === conn) delete connectionsRef.current[pid]
+            reconnectAttemptsRef.current[pid] = 0
+            attemptReconnect(pid)
+          }
+        }
+      })
+    }, 15000)
+    return () => clearInterval(hbInterval)
+  }, [])
+
+  // Mesh maintenance every 10 s — faster than before (was 30 s) so WiFi users
+  // who drop and reconnect are re-meshed within ~10 s instead of ~30 s.
   useEffect(() => {
     const meshInterval = setInterval(() => {
       if (!peerRef.current || !myIdRef.current) return
+      // Keep PeerJS signaling alive (WebSocket can drop on WiFi)
+      if (peerRef.current.disconnected && !peerRef.current.destroyed) {
+        try { peerRef.current.reconnect() } catch {}
+      }
       // Re-connect to every group member
       Object.values(groupsRef.current).forEach(group => {
         ;(group.members || []).forEach(pid => {
           if (pid !== myIdRef.current && (!connectionsRef.current[pid] || !connectionsRef.current[pid].open)) {
-            reconnectAttemptsRef.current[pid] = 0  // reset so 5-attempt cap doesn't block us
+            reconnectAttemptsRef.current[pid] = 0
             attemptReconnect(pid)
           }
         })
       })
-      // Also re-connect to DM contacts
+      // Re-connect to DM contacts
       Object.keys(contactsRef.current).forEach(pid => {
         if (!connectionsRef.current[pid] || !connectionsRef.current[pid].open) {
           reconnectAttemptsRef.current[pid] = 0
           attemptReconnect(pid)
         }
       })
-    }, 30000)
+    }, 10000)
     return () => clearInterval(meshInterval)
   }, [])
 
